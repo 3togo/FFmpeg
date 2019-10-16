@@ -41,7 +41,7 @@
 #include "video.h"
 void Image_Minus(IplImage *X, IplImage *Y, IplImage *X_Y);
 void Image_Cut(IplImage *X, IplImage *Y1, IplImage *Y2);
-void Image_Cut2(IplImage *X, IplImage *Y1);
+void Image_Cut2(IplImage *X, IplImage *Y, IplImage *Y2);
 static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
 {
     IplImage *tmpimg;
@@ -373,22 +373,27 @@ void Image_Cut(IplImage *X, IplImage *Y1, IplImage *Y2)
 //}
 
 
-void Image_Cut2(IplImage *X, IplImage *Y)
+void Image_Cut2(IplImage *X, IplImage *Y, IplImage *Y2)
 {
     int i,j,width,height,channel,count=0;
-    unsigned char *dataX, *dataY;
+    unsigned char *dataX, *dataY, *dataY2;
     width = X->width;
     height = X->height;
     dataX = (unsigned char *)X->imageData;
     dataY = (unsigned char *)Y->imageData;
+    dataY2 = (unsigned char *)Y2->imageData;
+
     int step = X->widthStep/sizeof(char);
     int stepy = Y->widthStep/sizeof(char);
+    int stepy2 = Y2->widthStep/sizeof(char);
     channel = X->nChannels;
     printf("step=%d, channel=%d, width=%d, height=%d, X->widthStep=%d, stepy=%d------------------------\n",
             step, channel, width, height, X->widthStep, stepy);
     for(i=0; i<height; i++)
         for(j=0; j<width/2; j++) {
-            dataY[i*stepy+j] = dataX[i*step+3*j];
+            for (int k=0; k< 3; k++)
+                dataY[i*stepy+j*3+k] = dataX[i*step+3*j+k];
+            dataY2[i*stepy2+j] = dataX[i*step+3*j+step/2];
             count++;
         }
     //printf("%d %d %d",width, height, count);
@@ -416,7 +421,7 @@ static void dilate_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplIm
                                inimg->nChannels);
 
     //IplImage *srcimg;
-    Image_Cut2(inimg, depimg_gray);
+    Image_Cut2(inimg, srcimg, depimg_gray);
     //cvCopy(inimg, inimg2, NULL);
     //inimg2 = cvCloneImage(inimg);
     //cvSetImageROI(inimg,cvRect(0,0,w2,h));
@@ -424,8 +429,8 @@ static void dilate_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplIm
     //cvResetImageROI(inimg);
     //cvSetImageROI(inimg,cvRect(w2,0,w2,h));
     //cvCopy(inimg, depimg, NULL);
-    cvCvtColor(depimg_gray,depimg,CV_GRAY2BGR);
-    cvResize(depimg, outimg, CV_INTER_LINEAR);
+        //cvCvtColor(depimg_gray,depimg,CV_GRAY2BGR);
+        cvResize(srcimg, outimg, CV_INTER_LINEAR);
     //Image_Minus(inimg, outimg, outimg);
     //CvMat outmat, mat_src, mat_dep;
     //cvGetMat(outimg, &outmat, 0, 0);
