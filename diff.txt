@@ -1,0 +1,935 @@
+diff --git a/.gitignore b/.gitignore
+index 2450ee8fc5..8e8014658b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -37,3 +37,4 @@
+ /src
+ /mapfile
+ /tools/python/__pycache__/
++*.make
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 16bb8cd965..8a208e6d9b 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -227,6 +227,7 @@ OBJS-$(CONFIG_DRAWGRAPH_FILTER)              += f_drawgraph.o
+ OBJS-$(CONFIG_DRAWGRID_FILTER)               += vf_drawbox.o
+ OBJS-$(CONFIG_DRAWTEXT_FILTER)               += vf_drawtext.o
+ OBJS-$(CONFIG_EDGEDETECT_FILTER)             += vf_edgedetect.o
++OBJS-$(CONFIG_FOOBAR_FILTER)                 += vf_foobar.o
+ OBJS-$(CONFIG_ELBG_FILTER)                   += vf_elbg.o
+ OBJS-$(CONFIG_ENTROPY_FILTER)                += vf_entropy.o
+ OBJS-$(CONFIG_EQ_FILTER)                     += vf_eq.o
+@@ -310,6 +311,7 @@ OBJS-$(CONFIG_NORMALIZE_FILTER)              += vf_normalize.o
+ OBJS-$(CONFIG_NULL_FILTER)                   += vf_null.o
+ OBJS-$(CONFIG_OCR_FILTER)                    += vf_ocr.o
+ OBJS-$(CONFIG_OCV_FILTER)                    += vf_libopencv.o
++OBJS-$(CONFIG_OCV_FILTER)                    += vf_libdibr.o
+ OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o
+ OBJS-$(CONFIG_OVERLAY_FILTER)                += vf_overlay.o framesync.o
+ OBJS-$(CONFIG_OVERLAY_OPENCL_FILTER)         += vf_overlay_opencl.o opencl.o \
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 4f8b3039ed..b7f77d9d8b 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -295,6 +295,7 @@ extern AVFilter ff_vf_normalize;
+ extern AVFilter ff_vf_null;
+ extern AVFilter ff_vf_ocr;
+ extern AVFilter ff_vf_ocv;
++extern AVFilter ff_vf_odibr;
+ extern AVFilter ff_vf_oscilloscope;
+ extern AVFilter ff_vf_overlay;
+ extern AVFilter ff_vf_overlay_opencl;
+diff --git a/libavfilter/vf_foobar.c b/libavfilter/vf_foobar.c
+new file mode 100644
+index 0000000000..7bd20420b4
+--- /dev/null
++++ b/libavfilter/vf_foobar.c
+@@ -0,0 +1,442 @@
++/*
++ * Copyright (c) 2012-2014 Clément Bœsch <u pkh me>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Edge detection filter
++ *
++ * @see https://en.wikipedia.org/wiki/Canny_edge_detector
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/opt.h"
++#include "avfilter.h"
++#include "formats.h"
++#include "internal.h"
++#include "video.h"
++
++#define PLANE_R 0x4
++#define PLANE_G 0x1
++#define PLANE_B 0x2
++#define PLANE_Y 0x1
++#define PLANE_U 0x2
++#define PLANE_V 0x4
++#define PLANE_A 0x8
++
++enum FilterMode {
++    MODE_WIRES,
++    MODE_COLORMIX,
++    MODE_CANNY,
++    NB_MODE
++};
++
++struct plane_info {
++    uint8_t  *tmpbuf;
++    uint16_t *gradients;
++    char     *directions;
++    int      width, height;
++};
++
++typedef struct FoobarContext {
++    const AVClass *class;
++    struct plane_info planes[3];
++    int filter_planes;
++    int nb_planes;
++    double   low, high;
++    uint8_t  low_u8, high_u8;
++    int mode;
++} FoobarContext;
++
++#define OFFSET(x) offsetof(FoobarContext, x)
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
++static const AVOption foobar_options[] = {
++    { "high", "set high threshold", OFFSET(high), AV_OPT_TYPE_DOUBLE, {.dbl=50/255.}, 0, 1, FLAGS },
++    { "low",  "set low threshold",  OFFSET(low),  AV_OPT_TYPE_DOUBLE, {.dbl=20/255.}, 0, 1, FLAGS },
++    { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=MODE_WIRES}, 0, NB_MODE-1, FLAGS, "mode" },
++        { "wires",    "white/gray wires on black",  0, AV_OPT_TYPE_CONST, {.i64=MODE_WIRES},    INT_MIN, INT_MAX, FLAGS, "mode" },
++        { "colormix", "mix colors",                 0, AV_OPT_TYPE_CONST, {.i64=MODE_COLORMIX}, INT_MIN, INT_MAX, FLAGS, "mode" },
++        { "canny",    "detect edges on planes",     0, AV_OPT_TYPE_CONST, {.i64=MODE_CANNY},    INT_MIN, INT_MAX, FLAGS, "mode" },
++    { "planes", "set planes to filter",  OFFSET(filter_planes), AV_OPT_TYPE_FLAGS, {.i64=7}, 1, 0x7, FLAGS, "flags" },
++        { "y", "filter luma plane",  0, AV_OPT_TYPE_CONST, {.i64=PLANE_Y}, 0, 0, FLAGS, "flags" },
++        { "u", "filter u plane",     0, AV_OPT_TYPE_CONST, {.i64=PLANE_U}, 0, 0, FLAGS, "flags" },
++        { "v", "filter v plane",     0, AV_OPT_TYPE_CONST, {.i64=PLANE_V}, 0, 0, FLAGS, "flags" },
++        { "r", "filter red plane",   0, AV_OPT_TYPE_CONST, {.i64=PLANE_R}, 0, 0, FLAGS, "flags" },
++        { "g", "filter green plane", 0, AV_OPT_TYPE_CONST, {.i64=PLANE_G}, 0, 0, FLAGS, "flags" },
++        { "b", "filter blue plane",  0, AV_OPT_TYPE_CONST, {.i64=PLANE_B}, 0, 0, FLAGS, "flags" },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(foobar);
++
++static av_cold int init(AVFilterContext *ctx)
++{
++    FoobarContext *foobar = ctx->priv;
++
++    foobar->low_u8  = foobar->low  * 255. + .5;
++    foobar->high_u8 = foobar->high * 255. + .5;
++    return 0;
++}
++
++static int query_formats(AVFilterContext *ctx)
++{
++    const FoobarContext *foobar = ctx->priv;
++    static const enum AVPixelFormat wires_pix_fmts[] = {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE};
++    static const enum AVPixelFormat canny_pix_fmts[] = {AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_GBRP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE};
++    static const enum AVPixelFormat colormix_pix_fmts[] = {AV_PIX_FMT_GBRP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE};
++    AVFilterFormats *fmts_list;
++    const enum AVPixelFormat *pix_fmts = NULL;
++
++    if (foobar->mode == MODE_WIRES) {
++        pix_fmts = wires_pix_fmts;
++    } else if (foobar->mode == MODE_COLORMIX) {
++        pix_fmts = colormix_pix_fmts;
++    } else if (foobar->mode == MODE_CANNY) {
++        pix_fmts = canny_pix_fmts;
++    } else {
++        av_assert0(0);
++    }
++    fmts_list = ff_make_format_list(pix_fmts);
++    if (!fmts_list)
++        return AVERROR(ENOMEM);
++    return ff_set_common_formats(ctx, fmts_list);
++}
++
++static int config_props(AVFilterLink *inlink)
++{
++    int p;
++    AVFilterContext *ctx = inlink->dst;
++    FoobarContext *foobar = ctx->priv;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
++
++    foobar->nb_planes = inlink->format == AV_PIX_FMT_GRAY8 ? 1 : 3;
++    for (p = 0; p < foobar->nb_planes; p++) {
++        struct plane_info *plane = &foobar->planes[p];
++        int vsub = p ? desc->log2_chroma_h : 0;
++        int hsub = p ? desc->log2_chroma_w : 0;
++
++        plane->width      = AV_CEIL_RSHIFT(inlink->w, hsub);
++        plane->height     = AV_CEIL_RSHIFT(inlink->h, vsub);
++        plane->tmpbuf     = av_malloc(plane->width * plane->height);
++        plane->gradients  = av_calloc(plane->width * plane->height, sizeof(*plane->gradients));
++        plane->directions = av_malloc(plane->width * plane->height);
++        if (!plane->tmpbuf || !plane->gradients || !plane->directions)
++            return AVERROR(ENOMEM);
++    }
++    return 0;
++}
++
++static void gaussian_blur(AVFilterContext *ctx, int w, int h,
++                                uint8_t *dst, int dst_linesize,
++                          const uint8_t *src, int src_linesize)
++{
++    int i, j;
++
++    memcpy(dst, src, w); dst += dst_linesize; src += src_linesize;
++    if (h > 1) {
++        memcpy(dst, src, w); dst += dst_linesize; src += src_linesize;
++    }
++    for (j = 2; j < h - 2; j++) {
++        dst[0] = src[0];
++        dst[1] = src[1];
++        for (i = 2; i < w - 2; i++) {
++            /* Gaussian mask of size 5x5 with sigma = 1.4 */
++            dst[i] = ((src[-2*src_linesize + i-2] + src[2*src_linesize + i-2]) * 2
++                    + (src[-2*src_linesize + i-1] + src[2*src_linesize + i-1]) * 4
++                    + (src[-2*src_linesize + i  ] + src[2*src_linesize + i  ]) * 5
++                    + (src[-2*src_linesize + i+1] + src[2*src_linesize + i+1]) * 4
++                    + (src[-2*src_linesize + i+2] + src[2*src_linesize + i+2]) * 2
++
++                    + (src[  -src_linesize + i-2] + src[  src_linesize + i-2]) *  4
++                    + (src[  -src_linesize + i-1] + src[  src_linesize + i-1]) *  9
++                    + (src[  -src_linesize + i  ] + src[  src_linesize + i  ]) * 12
++                    + (src[  -src_linesize + i+1] + src[  src_linesize + i+1]) *  9
++                    + (src[  -src_linesize + i+2] + src[  src_linesize + i+2]) *  4
++
++                    + src[i-2] *  5
++                    + src[i-1] * 12
++                    + src[i  ] * 15
++                    + src[i+1] * 12
++                    + src[i+2] *  5) / 159;
++        }
++        dst[i    ] = src[i    ];
++        dst[i + 1] = src[i + 1];
++
++        dst += dst_linesize;
++        src += src_linesize;
++    }
++    if (h > 2) {
++        memcpy(dst, src, w); dst += dst_linesize; src += src_linesize;
++    }
++    if (h > 3)
++        memcpy(dst, src, w);
++}
++
++enum {
++    DIRECTION_45UP,
++    DIRECTION_45DOWN,
++    DIRECTION_HORIZONTAL,
++    DIRECTION_VERTICAL,
++};
++
++static int get_rounded_direction(int gx, int gy)
++{
++    /* reference angles:
++     *   tan( pi/8) = sqrt(2)-1
++     *   tan(3pi/8) = sqrt(2)+1
++     * Gy/Gx is the tangent of the angle (theta), so Gy/Gx is compared against
++     * <ref-angle>, or more simply Gy against <ref-angle>*Gx
++     *
++     * Gx and Gy bounds = [-1020;1020], using 16-bit arithmetic:
++     *   round((sqrt(2)-1) * (1<<16)) =  27146
++     *   round((sqrt(2)+1) * (1<<16)) = 158218
++     */
++    if (gx) {
++        int tanpi8gx, tan3pi8gx;
++
++        if (gx < 0)
++            gx = -gx, gy = -gy;
++        gy <<= 16;
++        tanpi8gx  =  27146 * gx;
++        tan3pi8gx = 158218 * gx;
++        if (gy > -tan3pi8gx && gy < -tanpi8gx)  return DIRECTION_45UP;
++        if (gy > -tanpi8gx  && gy <  tanpi8gx)  return DIRECTION_HORIZONTAL;
++        if (gy >  tanpi8gx  && gy <  tan3pi8gx) return DIRECTION_45DOWN;
++    }
++    return DIRECTION_VERTICAL;
++}
++
++static void sobel(int w, int h,
++                       uint16_t *dst, int dst_linesize,
++                         int8_t *dir, int dir_linesize,
++                  const uint8_t *src, int src_linesize)
++{
++    int i, j;
++
++    for (j = 1; j < h - 1; j++) {
++        dst += dst_linesize;
++        dir += dir_linesize;
++        src += src_linesize;
++        for (i = 1; i < w - 1; i++) {
++            const int gx =
++                -1*src[-src_linesize + i-1] + 1*src[-src_linesize + i+1]
++                -2*src[                i-1] + 2*src[                i+1]
++                -1*src[ src_linesize + i-1] + 1*src[ src_linesize + i+1];
++            const int gy =
++                -1*src[-src_linesize + i-1] + 1*src[ src_linesize + i-1]
++                -2*src[-src_linesize + i  ] + 2*src[ src_linesize + i  ]
++                -1*src[-src_linesize + i+1] + 1*src[ src_linesize + i+1];
++
++            dst[i] = FFABS(gx) + FFABS(gy);
++            dir[i] = get_rounded_direction(gx, gy);
++        }
++    }
++}
++
++static void non_maximum_suppression(int w, int h,
++                                          uint8_t  *dst, int dst_linesize,
++                                    const  int8_t  *dir, int dir_linesize,
++                                    const uint16_t *src, int src_linesize)
++{
++    int i, j;
++
++#define COPY_MAXIMA(ay, ax, by, bx) do {                \
++    if (src[i] > src[(ay)*src_linesize + i+(ax)] &&     \
++        src[i] > src[(by)*src_linesize + i+(bx)])       \
++        dst[i] = av_clip_uint8(src[i]);                 \
++} while (0)
++
++    for (j = 1; j < h - 1; j++) {
++        dst += dst_linesize;
++        dir += dir_linesize;
++        src += src_linesize;
++        for (i = 1; i < w - 1; i++) {
++            switch (dir[i]) {
++            case DIRECTION_45UP:        COPY_MAXIMA( 1, -1, -1,  1); break;
++            case DIRECTION_45DOWN:      COPY_MAXIMA(-1, -1,  1,  1); break;
++            case DIRECTION_HORIZONTAL:  COPY_MAXIMA( 0, -1,  0,  1); break;
++            case DIRECTION_VERTICAL:    COPY_MAXIMA(-1,  0,  1,  0); break;
++            }
++        }
++    }
++}
++
++static void double_threshold(int low, int high, int w, int h,
++                                   uint8_t *dst, int dst_linesize,
++                             const uint8_t *src, int src_linesize)
++{
++    int i, j;
++
++    for (j = 0; j < h; j++) {
++        for (i = 0; i < w; i++) {
++            if (src[i] > high) {
++                dst[i] = src[i];
++                continue;
++            }
++
++            if ((!i || i == w - 1 || !j || j == h - 1) &&
++                src[i] > low &&
++                (src[-src_linesize + i-1] > high ||
++                 src[-src_linesize + i  ] > high ||
++                 src[-src_linesize + i+1] > high ||
++                 src[                i-1] > high ||
++                 src[                i+1] > high ||
++                 src[ src_linesize + i-1] > high ||
++                 src[ src_linesize + i  ] > high ||
++                 src[ src_linesize + i+1] > high))
++                dst[i] = src[i];
++            else
++                dst[i] = 0;
++        }
++        dst += dst_linesize;
++        src += src_linesize;
++    }
++}
++
++static void color_mix(int w, int h,
++                            uint8_t *dst, int dst_linesize,
++                      const uint8_t *src, int src_linesize)
++{
++    int i, j;
++
++    for (j = 0; j < h; j++) {
++        for (i = 0; i < w; i++)
++            dst[i] = (dst[i] + src[i]) >> 1;
++        dst += dst_linesize;
++        src += src_linesize;
++    }
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *ctx = inlink->dst;
++    FoobarContext *foobar = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    int p, direct = 0;
++    AVFrame *out;
++
++    if (foobar->mode != MODE_COLORMIX && av_frame_is_writable(in)) {
++        direct = 1;
++        out = in;
++    } else {
++        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++        if (!out) {
++            av_frame_free(&in);
++            return AVERROR(ENOMEM);
++        }
++        av_frame_copy_props(out, in);
++    }
++
++    for (p = 0; p < foobar->nb_planes; p++) {
++        struct plane_info *plane = &foobar->planes[p];
++        uint8_t  *tmpbuf     = plane->tmpbuf;
++        uint16_t *gradients  = plane->gradients;
++        int8_t   *directions = plane->directions;
++        const int width      = plane->width;
++        const int height     = plane->height;
++
++        if (!((1 << p) & foobar->filter_planes)) {
++            if (!direct)
++                av_image_copy_plane(out->data[p], out->linesize[p],
++                                    in->data[p], in->linesize[p],
++                                    width, height);
++            continue;
++        }
++
++        /* gaussian filter to reduce noise  */
++        gaussian_blur(ctx, width, height,
++                      tmpbuf,      width,
++                      in->data[p], in->linesize[p]);
++
++        /* compute the 16-bits gradients and directions for the next step */
++        sobel(width, height,
++              gradients, width,
++              directions,width,
++              tmpbuf,    width);
++
++        /* non_maximum_suppression() will actually keep & clip what's necessary and
++         * ignore the rest, so we need a clean output buffer */
++        memset(tmpbuf, 0, width * height);
++        non_maximum_suppression(width, height,
++                                tmpbuf,    width,
++                                directions,width,
++                                gradients, width);
++
++        /* keep high values, or low values surrounded by high values */
++        double_threshold(foobar->low_u8, foobar->high_u8,
++                         width, height,
++                         out->data[p], out->linesize[p],
++                         tmpbuf,       width);
++
++        if (foobar->mode == MODE_COLORMIX) {
++            color_mix(width, height,
++                      out->data[p], out->linesize[p],
++                      in->data[p], in->linesize[p]);
++        }
++    }
++
++    if (!direct)
++        av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    int p;
++    FoobarContext *foobar = ctx->priv;
++
++    for (p = 0; p < foobar->nb_planes; p++) {
++        struct plane_info *plane = &foobar->planes[p];
++        av_freep(&plane->tmpbuf);
++        av_freep(&plane->gradients);
++        av_freep(&plane->directions);
++    }
++}
++
++static const AVFilterPad foobar_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_props,
++        .filter_frame = filter_frame,
++    },
++    { NULL }
++};
++
++static const AVFilterPad foobar_outputs[] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++    },
++    { NULL }
++};
++
++AVFilter ff_vf_foobar = {
++    .name          = "foobar",
++    .description   = NULL_IF_CONFIG_SMALL("Detect and draw edge."),
++    .priv_size     = sizeof(FoobarContext),
++    .init          = init,
++    .uninit        = uninit,
++    .query_formats = query_formats,
++    .inputs        = foobar_inputs,
++    .outputs       = foobar_outputs,
++    .priv_class    = &foobar_class,
++    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
++};
+diff --git a/libavfilter/vf_libdibr.c b/libavfilter/vf_libdibr.c
+new file mode 100644
+index 0000000000..c7edc356ae
+--- /dev/null
++++ b/libavfilter/vf_libdibr.c
+@@ -0,0 +1,440 @@
++/*
++ * Copyright (c) 2010 Stefano Sabatini
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * libdibr wrapper functions
++ */
++
++#include "config.h"
++#if HAVE_OPENCV2_CORE_CORE_C_H
++#include <opencv2/core/core_c.h>
++#include <opencv2/imgproc/imgproc_c.h>
++#else
++#include <opencv/cv.h>
++#include <opencv/cxcore.h>
++#endif
++#include "libavutil/avstring.h"
++#include "libavutil/common.h"
++#include "libavutil/file.h"
++#include "libavutil/opt.h"
++#include "avfilter.h"
++#include "formats.h"
++#include "internal.h"
++#include "video.h"
++
++static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
++{
++    IplImage *tmpimg;
++    int depth, channels_nb;
++
++    if      (pixfmt == AV_PIX_FMT_GRAY8) { depth = IPL_DEPTH_8U;  channels_nb = 1; }
++    else if (pixfmt == AV_PIX_FMT_BGRA)  { depth = IPL_DEPTH_8U;  channels_nb = 4; }
++    else if (pixfmt == AV_PIX_FMT_BGR24) { depth = IPL_DEPTH_8U;  channels_nb = 3; }
++    else return;
++
++    tmpimg = cvCreateImageHeader((CvSize){frame->width, frame->height}, depth, channels_nb);
++    *img = *tmpimg;
++    img->imageData = img->imageDataOrigin = frame->data[0];
++    img->dataOrder = IPL_DATA_ORDER_PIXEL;
++    img->origin    = IPL_ORIGIN_TL;
++    img->widthStep = frame->linesize[0];
++}
++
++static void fill_frame_from_iplimage(AVFrame *frame, const IplImage *img, enum AVPixelFormat pixfmt)
++{
++    frame->linesize[0] = img->widthStep;
++    frame->data[0]     = img->imageData;
++}
++
++static int query_formats(AVFilterContext *ctx)
++{
++    static const enum AVPixelFormat pix_fmts[] = {
++        AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
++    };
++    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
++    if (!fmts_list)
++        return AVERROR(ENOMEM);
++    return ff_set_common_formats(ctx, fmts_list);
++}
++
++typedef struct ODIBRContext {
++    const AVClass *class;
++    char *name;
++    char *params;
++    int (*init)(AVFilterContext *ctx, const char *args);
++    void (*uninit)(AVFilterContext *ctx);
++    void (*end_frame_filter)(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg);
++    void *priv;
++} ODIBRContext;
++
++typedef struct SmoothContext {
++    int type;
++    int    param1, param2;
++    double param3, param4;
++} SmoothContext;
++
++static av_cold int smooth_init(AVFilterContext *ctx, const char *args)
++{
++    ODIBRContext *s = ctx->priv;
++    SmoothContext *smooth = s->priv;
++    char type_str[128] = "gaussian";
++
++    smooth->param1 = 3;
++    smooth->param2 = 0;
++    smooth->param3 = 0.0;
++    smooth->param4 = 0.0;
++
++    if (args)
++        sscanf(args, "%127[^|]|%d|%d|%lf|%lf", type_str, &smooth->param1, &smooth->param2, &smooth->param3, &smooth->param4);
++
++    if      (!strcmp(type_str, "blur"         )) smooth->type = CV_BLUR;
++    else if (!strcmp(type_str, "blur_no_scale")) smooth->type = CV_BLUR_NO_SCALE;
++    else if (!strcmp(type_str, "median"       )) smooth->type = CV_MEDIAN;
++    else if (!strcmp(type_str, "gaussian"     )) smooth->type = CV_GAUSSIAN;
++    else if (!strcmp(type_str, "bilateral"    )) smooth->type = CV_BILATERAL;
++    else {
++        av_log(ctx, AV_LOG_ERROR, "Smoothing type '%s' unknown.\n", type_str);
++        return AVERROR(EINVAL);
++    }
++
++    if (smooth->param1 < 0 || !(smooth->param1%2)) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Invalid value '%d' for param1, it has to be a positive odd number\n",
++               smooth->param1);
++        return AVERROR(EINVAL);
++    }
++    if ((smooth->type == CV_BLUR || smooth->type == CV_BLUR_NO_SCALE || smooth->type == CV_GAUSSIAN) &&
++        (smooth->param2 < 0 || (smooth->param2 && !(smooth->param2%2)))) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Invalid value '%d' for param2, it has to be zero or a positive odd number\n",
++               smooth->param2);
++        return AVERROR(EINVAL);
++    }
++
++    av_log(ctx, AV_LOG_VERBOSE, "type:%s param1:%d param2:%d param3:%f param4:%f\n",
++           type_str, smooth->param1, smooth->param2, smooth->param3, smooth->param4);
++    return 0;
++}
++
++static void smooth_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg)
++{
++    ODIBRContext *s = ctx->priv;
++    SmoothContext *smooth = s->priv;
++    cvSmooth(inimg, outimg, smooth->type, smooth->param1, smooth->param2, smooth->param3, smooth->param4);
++}
++
++static int read_shape_from_file(int *cols, int *rows, int **values, const char *filename,
++                                void *log_ctx)
++{
++    uint8_t *buf, *p, *pend;
++    size_t size;
++    int ret, i, j, w;
++
++    if ((ret = av_file_map(filename, &buf, &size, 0, log_ctx)) < 0)
++        return ret;
++
++    /* prescan file to get the number of lines and the maximum width */
++    w = 0;
++    for (i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            if (*rows == INT_MAX) {
++                av_log(log_ctx, AV_LOG_ERROR, "Overflow on the number of rows in the file\n");
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
++            ++(*rows);
++            *cols = FFMAX(*cols, w);
++            w = 0;
++        } else if (w == INT_MAX) {
++            av_log(log_ctx, AV_LOG_ERROR, "Overflow on the number of columns in the file\n");
++            return AVERROR_INVALIDDATA;
++        }
++        w++;
++    }
++    if (*rows > (SIZE_MAX / sizeof(int) / *cols)) {
++        av_log(log_ctx, AV_LOG_ERROR, "File with size %dx%d is too big\n",
++               *rows, *cols);
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++    if (!(*values = av_mallocz_array(sizeof(int) * *rows, *cols))) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++
++    /* fill *values */
++    p    = buf;
++    pend = buf + size-1;
++    for (i = 0; i < *rows; i++) {
++        for (j = 0;; j++) {
++            if (p > pend || *p == '\n') {
++                p++;
++                break;
++            } else
++                (*values)[*cols*i + j] = !!av_isgraph(*(p++));
++        }
++    }
++
++end:
++    av_file_unmap(buf, size);
++
++#ifdef DEBUG
++    {
++        char *line;
++        if (!(line = av_malloc(*cols + 1)))
++            return AVERROR(ENOMEM);
++        for (i = 0; i < *rows; i++) {
++            for (j = 0; j < *cols; j++)
++                line[j] = (*values)[i * *cols + j] ? '@' : ' ';
++            line[j] = 0;
++            av_log(log_ctx, AV_LOG_DEBUG, "%3d: %s\n", i, line);
++        }
++        av_free(line);
++    }
++#endif
++
++    return 0;
++}
++
++static int parse_iplconvkernel(IplConvKernel **kernel, char *buf, void *log_ctx)
++{
++    char shape_filename[128] = "", shape_str[32] = "rect";
++    int cols = 0, rows = 0, anchor_x = 0, anchor_y = 0, shape = CV_SHAPE_RECT;
++    int *values = NULL, ret = 0;
++
++    sscanf(buf, "%dx%d+%dx%d/%32[^=]=%127s", &cols, &rows, &anchor_x, &anchor_y, shape_str, shape_filename);
++
++    if      (!strcmp(shape_str, "rect"   )) shape = CV_SHAPE_RECT;
++    else if (!strcmp(shape_str, "cross"  )) shape = CV_SHAPE_CROSS;
++    else if (!strcmp(shape_str, "ellipse")) shape = CV_SHAPE_ELLIPSE;
++    else if (!strcmp(shape_str, "custom" )) {
++        shape = CV_SHAPE_CUSTOM;
++        if ((ret = read_shape_from_file(&cols, &rows, &values, shape_filename, log_ctx)) < 0)
++            return ret;
++    } else {
++        av_log(log_ctx, AV_LOG_ERROR,
++               "Shape unspecified or type '%s' unknown.\n", shape_str);
++        ret = AVERROR(EINVAL);
++        goto out;
++    }
++
++    if (rows <= 0 || cols <= 0) {
++        av_log(log_ctx, AV_LOG_ERROR,
++               "Invalid non-positive values for shape size %dx%d\n", cols, rows);
++        ret = AVERROR(EINVAL);
++        goto out;
++    }
++
++    if (anchor_x < 0 || anchor_y < 0 || anchor_x >= cols || anchor_y >= rows) {
++        av_log(log_ctx, AV_LOG_ERROR,
++               "Shape anchor %dx%d is not inside the rectangle with size %dx%d.\n",
++               anchor_x, anchor_y, cols, rows);
++        ret = AVERROR(EINVAL);
++        goto out;
++    }
++
++    *kernel = cvCreateStructuringElementEx(cols, rows, anchor_x, anchor_y, shape, values);
++    if (!*kernel) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++
++    av_log(log_ctx, AV_LOG_VERBOSE, "Structuring element: w:%d h:%d x:%d y:%d shape:%s\n",
++           rows, cols, anchor_x, anchor_y, shape_str);
++out:
++    av_freep(&values);
++    return ret;
++}
++
++typedef struct DilateContext {
++    int nb_iterations;
++    IplConvKernel *kernel;
++} DilateContext;
++
++static av_cold int dilate_init(AVFilterContext *ctx, const char *args)
++{
++    ODIBRContext *s = ctx->priv;
++    DilateContext *dilate = s->priv;
++    char default_kernel_str[] = "3x3+0x0/rect";
++    char *kernel_str = NULL;
++    const char *buf = args;
++    int ret;
++
++    if (args) {
++        kernel_str = av_get_token(&buf, "|");
++
++        if (!kernel_str)
++            return AVERROR(ENOMEM);
++    }
++
++    ret = parse_iplconvkernel(&dilate->kernel,
++                              (!kernel_str || !*kernel_str) ? default_kernel_str
++                                                            : kernel_str,
++                              ctx);
++    av_free(kernel_str);
++    if (ret < 0)
++        return ret;
++
++    if (!buf || sscanf(buf, "|%d", &dilate->nb_iterations) != 1)
++        dilate->nb_iterations = 1;
++    av_log(ctx, AV_LOG_VERBOSE, "iterations_nb:%d\n", dilate->nb_iterations);
++    if (dilate->nb_iterations <= 0) {
++        av_log(ctx, AV_LOG_ERROR, "Invalid non-positive value '%d' for nb_iterations\n",
++               dilate->nb_iterations);
++        return AVERROR(EINVAL);
++    }
++    return 0;
++}
++
++static av_cold void dilate_uninit(AVFilterContext *ctx)
++{
++    ODIBRContext *s = ctx->priv;
++    DilateContext *dilate = s->priv;
++
++    cvReleaseStructuringElement(&dilate->kernel);
++}
++
++static void dilate_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg)
++{
++    ODIBRContext *s = ctx->priv;
++    DilateContext *dilate = s->priv;
++    cvDilate(inimg, outimg, dilate->kernel, dilate->nb_iterations);
++}
++
++static void erode_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg)
++{
++    ODIBRContext *s = ctx->priv;
++    DilateContext *dilate = s->priv;
++    cvErode(inimg, outimg, dilate->kernel, dilate->nb_iterations);
++}
++
++typedef struct ODIBRFilterEntry {
++    const char *name;
++    size_t priv_size;
++    int  (*init)(AVFilterContext *ctx, const char *args);
++    void (*uninit)(AVFilterContext *ctx);
++    void (*end_frame_filter)(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg);
++} ODIBRFilterEntry;
++
++static const ODIBRFilterEntry odibr_filter_entries[] = {
++    { "dilate", sizeof(DilateContext), dilate_init, dilate_uninit, dilate_end_frame_filter },
++    { "erode",  sizeof(DilateContext), dilate_init, dilate_uninit, erode_end_frame_filter  },
++    { "smooth", sizeof(SmoothContext), smooth_init, NULL, smooth_end_frame_filter },
++};
++
++static av_cold int init(AVFilterContext *ctx)
++{
++    ODIBRContext *s = ctx->priv;
++    int i;
++
++    if (!s->name) {
++        av_log(ctx, AV_LOG_ERROR, "No libdibr filter name specified\n");
++        return AVERROR(EINVAL);
++    }
++    for (i = 0; i < FF_ARRAY_ELEMS(odibr_filter_entries); i++) {
++        const ODIBRFilterEntry *entry = &odibr_filter_entries[i];
++        if (!strcmp(s->name, entry->name)) {
++            s->init             = entry->init;
++            s->uninit           = entry->uninit;
++            s->end_frame_filter = entry->end_frame_filter;
++
++            if (!(s->priv = av_mallocz(entry->priv_size)))
++                return AVERROR(ENOMEM);
++            return s->init(ctx, s->params);
++        }
++    }
++
++    av_log(ctx, AV_LOG_ERROR, "No libdibr filter named '%s'\n", s->name);
++    return AVERROR(EINVAL);
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    ODIBRContext *s = ctx->priv;
++
++    if (s->uninit)
++        s->uninit(ctx);
++    av_freep(&s->priv);
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *ctx = inlink->dst;
++    ODIBRContext *s = ctx->priv;
++    AVFilterLink *outlink= inlink->dst->outputs[0];
++    AVFrame *out;
++    IplImage inimg, outimg;
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        av_frame_free(&in);
++        return AVERROR(ENOMEM);
++    }
++    av_frame_copy_props(out, in);
++
++    fill_iplimage_from_frame(&inimg , in , inlink->format);
++    fill_iplimage_from_frame(&outimg, out, inlink->format);
++    s->end_frame_filter(ctx, &inimg, &outimg);
++    fill_frame_from_iplimage(out, &outimg, inlink->format);
++
++    av_frame_free(&in);
++
++    return ff_filter_frame(outlink, out);
++}
++
++#define OFFSET(x) offsetof(ODIBRContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
++static const AVOption odibr_options[] = {
++    { "filter_name",   NULL, OFFSET(name),   AV_OPT_TYPE_STRING, .flags = FLAGS },
++    { "filter_params", NULL, OFFSET(params), AV_OPT_TYPE_STRING, .flags = FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(odibr);
++
++static const AVFilterPad avfilter_vf_odibr_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++    },
++    { NULL }
++};
++
++static const AVFilterPad avfilter_vf_odibr_outputs[] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++    },
++    { NULL }
++};
++
++AVFilter ff_vf_odibr = {
++    .name          = "odibr",
++    .description   = NULL_IF_CONFIG_SMALL("Apply transform using libdibr."),
++    .priv_size     = sizeof(ODIBRContext),
++    .priv_class    = &odibr_class,
++    .query_formats = query_formats,
++    .init          = init,
++    .uninit        = uninit,
++    .inputs        = avfilter_vf_odibr_inputs,
++    .outputs       = avfilter_vf_odibr_outputs,
++};

@@ -39,7 +39,9 @@
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
-
+void Image_Minus(IplImage *X, IplImage *Y, IplImage *X_Y);
+void Image_Cut(IplImage *X, IplImage *Y1, IplImage *Y2);
+void Image_Cut2(IplImage *X, IplImage *Y1);
 static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
 {
     IplImage *tmpimg;
@@ -312,11 +314,134 @@ static av_cold void dilate_uninit(AVFilterContext *ctx)
     cvReleaseStructuringElement(&dilate->kernel);
 }
 
+void Image_Minus(IplImage *X, IplImage *Y, IplImage *X_Y)
+{
+    //图像差分函数，将图像1中像素和图像2中对应像素想减，要求X、Y、X_Y大小相同
+    int i,j,width,height,step,chanel;
+    unsigned char *dataX, *dataY, *dataX_Y;
+    width = X->width;
+    height = X->height;
+    dataX = (unsigned char *)X->imageData;
+    dataY = (unsigned char *)Y->imageData;
+    dataX_Y = (unsigned char *)X_Y->imageData;
+    step = X->widthStep/sizeof(char);
+    chanel = X->nChannels;
+    for(i=0; i<height; i++)
+        for(j=0; j<width*chanel; j++)
+            dataX_Y[i*step+j] = abs( dataX[i*step+j] - dataY[i*step+j]);
+}
+
+
+void Image_Cut(IplImage *X, IplImage *Y1, IplImage *Y2)
+{
+    int i,j,width,height,step,chanel,j_mid,count=0;
+    unsigned char *dataX, *dataY1, *dataY2;
+    width = X->width;
+    height = X->height;
+    dataX = (unsigned char *)X->imageData;
+    dataY1 = (unsigned char *)Y1->imageData;
+    dataY2 = (unsigned char *)Y2->imageData;
+    step = X->widthStep/sizeof(char);
+    chanel = X->nChannels;
+    for(i=0; i<height; i++)
+        for(j=0; j<width*chanel/2; j++) {
+            dataY1[i*step/2+j] =dataX[i*step+j];
+            dataY2[i*step/2+j] =dataX[i*step+j+width*chanel/2];
+        }
+}
+
+
+//void Image_Cut2(IplImage *X, IplImage *Y)
+//{
+    //int i,j,width,height,channel,count=0;
+    //unsigned char *dataX, *dataY;
+    //width = X->width;
+    //height = X->height;
+    //dataX = (unsigned char *)X->imageData;
+    //dataY = (unsigned char *)Y->imageData;
+    //int step = X->widthStep/sizeof(char);
+    //int stepy = Y->widthStep/sizeof(char);
+    //channel = X->nChannels;
+    //printf("newstep=%d, step=%d, channel=%d, width=%d, height=%d, X->widthStep=%d, stepy=%d------------------------\n",
+            //newstep, step, channel, width, height, X->widthStep, stepy);
+    //for(i=0; i<height; i++)
+        //for(j=0; j<width*channel/2; j++) {
+            //dataY[i*stepy+j] = dataX[i*step+j];
+            //count++;
+        //}
+    ////printf("%d %d %d",width, height, count);
+//}
+
+
+void Image_Cut2(IplImage *X, IplImage *Y)
+{
+    int i,j,width,height,channel,count=0;
+    unsigned char *dataX, *dataY;
+    width = X->width;
+    height = X->height;
+    dataX = (unsigned char *)X->imageData;
+    dataY = (unsigned char *)Y->imageData;
+    int step = X->widthStep/sizeof(char);
+    int stepy = Y->widthStep/sizeof(char);
+    channel = X->nChannels;
+    printf("step=%d, channel=%d, width=%d, height=%d, X->widthStep=%d, stepy=%d------------------------\n",
+            step, channel, width, height, X->widthStep, stepy);
+    for(i=0; i<height; i++)
+        for(j=0; j<width/2; j++) {
+            dataY[i*stepy+j] = dataX[i*step+3*j];
+            count++;
+        }
+    //printf("%d %d %d",width, height, count);
+}
+
+
 static void dilate_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg)
 {
+    IplImage *inimg2=0;
+    int h, w, w2;
     ODIBRContext *s = ctx->priv;
     DilateContext *dilate = s->priv;
-    cvDilate(inimg, outimg, dilate->kernel, dilate->nb_iterations);
+    //cvDilate(inimg, outimg, dilate->kernel, dilate->nb_iterations);
+    w = inimg->width;
+    h = inimg->height;
+    w2 = (int)(w/2);
+    IplImage *srcimg = cvCreateImage(cvSize(w/2, h),
+                               inimg->depth,
+                               inimg->nChannels);
+    IplImage *depimg_gray = cvCreateImage(cvSize(w/2, h),
+                               inimg->depth,
+                               1);
+    IplImage *depimg = cvCreateImage(cvSize(w/2, h),
+                               inimg->depth,
+                               inimg->nChannels);
+
+    //IplImage *srcimg;
+    Image_Cut2(inimg, depimg_gray);
+    //cvCopy(inimg, inimg2, NULL);
+    //inimg2 = cvCloneImage(inimg);
+    //cvSetImageROI(inimg,cvRect(0,0,w2,h));
+    //cvCopy(inimg, srcimg, NULL);
+    //cvResetImageROI(inimg);
+    //cvSetImageROI(inimg,cvRect(w2,0,w2,h));
+    //cvCopy(inimg, depimg, NULL);
+    cvCvtColor(depimg_gray,depimg,CV_GRAY2BGR);
+    cvResize(depimg, outimg, CV_INTER_LINEAR);
+    //Image_Minus(inimg, outimg, outimg);
+    //CvMat outmat, mat_src, mat_dep;
+    //cvGetMat(outimg, &outmat, 0, 0);
+    //h = outmat.rows;
+    //w = outmat.cols;
+
+    //printf("size=(%d,%d)___________________________\n", h, w);
+    //mat_src=outmat(CvRect(0,0,w2.h));
+    //h = mat_src.rows;
+    //w = mat_src.cols;
+    //printf("size=(%d,%d)___________________________==================\n", h, w);
+    //cvGetImage(&outmat, outimg);
+    //cvSobel(inimg, outimg, 1, 1, 3);
+    //cvReleaseImage(inimg2);
+    //cvReleaseImage(&srcimg);
+    //cvReleaseImage(&depimg);
 }
 
 static void erode_end_frame_filter(AVFilterContext *ctx, IplImage *inimg, IplImage *outimg)
@@ -438,3 +563,4 @@ AVFilter ff_vf_odibr = {
     .inputs        = avfilter_vf_odibr_inputs,
     .outputs       = avfilter_vf_odibr_outputs,
 };
+
